@@ -7,13 +7,18 @@ import "@openzeppelin/contracts/utils/EnumerableSet.sol";
 import "@openzeppelin/contracts/math/SafeMath.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./SovietToken.sol";
+import "./BadgePool.sol";
 
+
+interface IReferral {
+    function getReferrals(address _addr) external view returns (address[] memory);
+
+    function getInvitees(address _addr) external view returns (address[] memory);
+}
 
 // Note that it's ownable and the owner wields tremendous power. The ownership
 // will be transferred to a governance smart contract once SOV is sufficiently
 // distributed and the community can show to govern itself.
-//
-// Have fun reading it. Hopefully it's bug-free. God bless.
 contract Soviet is Ownable {
     using SafeMath for uint256;
     using SafeERC20 for IERC20;
@@ -22,6 +27,8 @@ contract Soviet is Ownable {
     struct UserInfo {
         uint256 amount;     // How many LP tokens the user has provided.
         uint256 rewardDebt; // Reward debt. See explanation below.
+        uint256 refReward;
+        uint256 harvested;
     }
 
     // Info of each pool.
@@ -30,16 +37,21 @@ contract Soviet is Ownable {
         uint256 allocPoint;         // How many allocation points assigned to this pool. SOVs to distribute per block.
         uint256 lastRewardBlock;    // Last block number that SOVs distribution occurs.
         uint256 accRewardPerShare;   // Accumulated SOVs per share, times 1e18. See below.
+        bool enableRefReward;
+        uint256 totalAmount;
     }
 
     // The SOV TOKEN!
     SovietToken public SOV;
+    IReferral public iRef;
+    IBadgePool public badgePool;
     // Dev address.
     address public devaddr;
     // Block number when bonus SOV period ends.
     uint256 public bonusEndBlock;
     // SOV tokens created per block.
     uint256 public rewardPerBlock;
+    uint256 public refRewards;
 
     // Info of each pool.
     PoolInfo[] public poolInfo;
@@ -63,17 +75,24 @@ contract Soviet is Ownable {
     constructor(
         SovietToken _SOV,
         address _devaddr,
-        uint256 _startBlock
+        uint256 _startBlock,
+        IReferral _iReferral
     ) public {
         SOV = _SOV;
         devaddr = _devaddr;
         startBlock = _startBlock;
-        rewardPerBlock = 10;
+        /*rewardPerBlock = 10;
         reductionBlockCount = 49000;
+        maxReductionCount = 7;
+        reductionPercent = 80;*/
+        rewardPerBlock = 1000 * (10 ** uint256(_SOV.decimals()));
+        reductionBlockCount = 10000;
         maxReductionCount = 7;
         reductionPercent = 80;
         bonusEndBlock = _startBlock + reductionBlockCount * maxReductionCount;
         nextReductionBlock = _startBlock + reductionBlockCount;
+        iRef = _iReferral;
+        badgePool = new BadgePool();
     }
 
     function poolLength() external view returns (uint256) {
@@ -81,8 +100,8 @@ contract Soviet is Ownable {
     }
 
     // Add a new lp to the pool. Can only be called by the owner.
-    // XXX DO NOT add the same LP token more than once. Rewards will be messed up if you do.
-    function add(uint256 _allocPoint, IERC20 _lpToken, bool _withUpdate) public onlyOwner {
+    // XXX DO NOT add the same LP/BPT token more than once. Rewards will be messed up if you do.
+    function add(uint256 _allocPoint, IERC20 _lpToken, bool _withUpdate, bool _enableRefReward) public onlyOwner {
         if (_withUpdate) {
             massUpdatePools();
         }
@@ -92,7 +111,9 @@ contract Soviet is Ownable {
         lpToken : _lpToken,
         allocPoint : _allocPoint,
         lastRewardBlock : lastRewardBlock,
-        accRewardPerShare : 0
+        accRewardPerShare : 0,
+        enableRefReward : _enableRefReward,
+        totalAmount : 0
         }));
     }
 
@@ -103,6 +124,11 @@ contract Soviet is Ownable {
         }
         totalAllocPoint = totalAllocPoint.sub(poolInfo[_pid].allocPoint).add(_allocPoint);
         poolInfo[_pid].allocPoint = _allocPoint;
+    }
+
+    // Set the badgePool contract. Can only be called by the owner.
+    function setBadgePool(IBadgePool _badgePool) public onlyOwner {
+        badgePool = _badgePool;
     }
 
     // Return reward multiplier over the given _from to _to block.
@@ -133,24 +159,26 @@ contract Soviet is Ownable {
     // Return reward per block
     function getBlockReward(uint256 _blockCount, uint256 _rewardPerBlock, uint256 _reductionCounter) internal view returns (uint256) {
         uint256 _reward = _blockCount * _rewardPerBlock;
-        if (_reductionCounter == 0){
+        if (_reductionCounter == 0) {
             return _reward;
         }
         return _reward * (reductionPercent ** _reductionCounter) / (100 ** _reductionCounter);
     }
 
     // View function to see pending SOVs on frontend.
-    function pendingReward(uint256 _pid, address _user) external view returns (uint256) {
+    function pendingReward(uint256 _pid, address _user) external view returns (uint256, uint256, uint256) {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_user];
         uint256 accRewardPerShare = pool.accRewardPerShare;
-        uint256 lpSupply = pool.lpToken.balanceOf(address(this));
+        uint256 lpSupply = pool.totalAmount;
+        uint256 blockReward;
+        uint256 poolReward;
         if (block.number > pool.lastRewardBlock && lpSupply != 0) {
-            uint256 blockReward = getBlocksReward(pool.lastRewardBlock, block.number);
-            uint256 poolReward = blockReward.mul(pool.allocPoint).div(totalAllocPoint);
+            blockReward = getBlocksReward(pool.lastRewardBlock, block.number);
+            poolReward = blockReward.mul(pool.allocPoint).div(totalAllocPoint);
             accRewardPerShare = accRewardPerShare.add(poolReward.mul(1e18).div(lpSupply));
         }
-        return user.amount.mul(accRewardPerShare).div(1e18).sub(user.rewardDebt);
+        return (user.amount.mul(accRewardPerShare).div(1e18).add(user.refReward).sub(user.rewardDebt), user.harvested, user.refReward);
     }
 
     // Update reward variables for all pools. Be careful of gas spending!
@@ -171,54 +199,92 @@ contract Soviet is Ownable {
             nextReductionBlock += reductionBlockCount;
             reductionCounter += 1;
         }
-        uint256 lpSupply = pool.lpToken.balanceOf(address(this));
+        uint256 lpSupply = pool.totalAmount;
         if (lpSupply == 0) {
             pool.lastRewardBlock = block.number;
             return;
         }
         uint256 blockReward = getBlocksReward(pool.lastRewardBlock, block.number);
         uint256 poolReward = blockReward.mul(pool.allocPoint).div(totalAllocPoint);
-        SOV.mint(devaddr, poolReward.div(10));
-        SOV.mint(address(this), poolReward);
+        uint256 extraReward = poolReward.div(10);
+        SOV.mint(devaddr, extraReward);
+        // Extra 10% rebate
+        SOV.mint(address(this), poolReward.add(extraReward));
         pool.accRewardPerShare = pool.accRewardPerShare.add(poolReward.mul(1e18).div(lpSupply));
         pool.lastRewardBlock = block.number;
     }
 
-    // Deposit LP tokens to Uprising for SOV allocation.
+    // Update referral reward when pool.enableRefWard is true
+    function updateRefReward(address _addr, uint256 _reward, uint256 _pid) internal {
+        PoolInfo storage pool = poolInfo[_pid];
+        if (!pool.enableRefReward) {
+            return;
+        }
+        address[] memory refs = iRef.getReferrals(_addr);
+        if (refs.length == 0) {
+            return;
+        }
+        uint256 ref0Reward = _reward.div(10).div(2);
+        userInfo[_pid][refs[0]].refReward += ref0Reward;
+        if (refs.length > 1) {
+            uint256 refnReward = ref0Reward.div(refs.length - 1);
+            for (uint256 idx = 1; idx < refs.length; idx ++) {
+                userInfo[_pid][refs[idx]].refReward += refnReward;
+            }
+        }
+    }
+
+    function harvest(address _addr, uint256 _amount, uint256 _pid) internal {
+        safeTokenTransfer(_addr, _amount);
+        userInfo[_pid][msg.sender].harvested = userInfo[_pid][msg.sender].harvested.add(_amount);
+        updateRefReward(_addr, _amount, _pid);
+        uint256 _miningRatePercent = badgePool.miningRate(_addr);
+        if (_miningRatePercent > 100) {
+            SOV.mint(_addr, _amount.mul(_miningRatePercent).div(100));
+        }
+    }
+
+    // Deposit BPT/LP tokens to Soviet for SOV allocation.
     function deposit(uint256 _pid, uint256 _amount) public {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
         updatePool(_pid);
-        if (user.amount > 0) {
-            uint256 pending = user.amount.mul(pool.accRewardPerShare).div(1e18).sub(user.rewardDebt);
+        if (user.amount > 0 || user.refReward > 0) {
+            uint256 pending = totalReward(pool, user).sub(user.rewardDebt);
             if (pending > 0) {
-                safeTokenTransfer(msg.sender, pending);
+                harvest(msg.sender, pending, _pid);
             }
         }
         if (_amount > 0) {
             pool.lpToken.safeTransferFrom(address(msg.sender), address(this), _amount);
             user.amount = user.amount.add(_amount);
+            pool.totalAmount = pool.totalAmount.add(_amount);
         }
-        user.rewardDebt = user.amount.mul(pool.accRewardPerShare).div(1e18);
+        user.rewardDebt = totalReward(pool, user);
         emit Deposit(msg.sender, _pid, _amount);
     }
 
-    // Withdraw LP tokens from Uprising.
+    // Withdraw BPT/LP tokens from Soviet.
     function withdraw(uint256 _pid, uint256 _amount) public {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
         require(user.amount >= _amount, "withdraw: not good");
         updatePool(_pid);
-        uint256 pending = user.amount.mul(pool.accRewardPerShare).div(1e18).sub(user.rewardDebt);
+        uint256 pending = totalReward(pool, user).sub(user.rewardDebt);
         if (pending > 0) {
-            safeTokenTransfer(msg.sender, pending);
+            harvest(msg.sender, pending, _pid);
         }
         if (_amount > 0) {
             user.amount = user.amount.sub(_amount);
+            pool.totalAmount = pool.totalAmount.sub(_amount);
             pool.lpToken.safeTransfer(address(msg.sender), _amount);
         }
-        user.rewardDebt = user.amount.mul(pool.accRewardPerShare).div(1e18);
+        user.rewardDebt = totalReward(pool, user).add(user.refReward);
         emit Withdraw(msg.sender, _pid, _amount);
+    }
+
+    function totalReward(PoolInfo storage _pool, UserInfo storage _user) internal returns (uint256){
+        return _user.amount.mul(_pool.accRewardPerShare).div(1e18).add(_user.refReward);
     }
 
     // Withdraw without caring about rewards. EMERGENCY ONLY.
@@ -229,6 +295,7 @@ contract Soviet is Ownable {
         emit EmergencyWithdraw(msg.sender, _pid, user.amount);
         user.amount = 0;
         user.rewardDebt = 0;
+        user.refReward = 0;
     }
 
     // Safe SOV transfer function, just in case if rounding error causes pool to not have enough SOVs.
